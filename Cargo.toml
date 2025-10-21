@@ -1,0 +1,28 @@
+[package]
+name = "pollux"
+description = "Queue worker pool"
+version = "0.0.1"
+edition = "2024"
+authors = ["whutchinson98"]
+include = ["src/**/*.rs"]
+categories = ["concurrency", "asynchronous"]
+homepage = "https://github.com/whutchinson98/queue-worker-pool"
+repository = "https://github.com/whutchinson98/queue-worker-pool"
+license = "MIT"
+readme = "README.md"
+keywords = ["queue", "worker", "async"]
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.16"
+tracing = "0.1.41"
+futures = "0.3.31"
+tokio = { version = "1.47.1", features = ["time", "rt-multi-thread"] }
+
+[dev-dependencies]
+aws-config = "1.8.6"
+aws-sdk-sqs = "1.83.0"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+anyhow = "1.0.99"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal"] }
+dotenv = "0.15.0"
