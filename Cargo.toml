@@ -1,13 +1,13 @@
 [package]
 name = "pollux"
 description = "Queue worker pool"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 authors = ["whutchinson98"]
 include = ["src/**/*.rs"]
 categories = ["concurrency", "asynchronous"]
-homepage = "https://github.com/whutchinson98/queue-worker-pool"
-repository = "https://github.com/whutchinson98/queue-worker-pool"
+homepage = "https://github.com/whutchinson98/pollux"
+repository = "https://github.com/whutchinson98/pollux"
 license = "MIT"
 readme = "README.md"
 keywords = ["queue", "worker", "async"]
