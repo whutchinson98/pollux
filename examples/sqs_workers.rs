@@ -147,7 +147,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let worker_pool_config = WorkerPoolConfig {
-        worker_count: 4,
+        receiver_count: 3,  // 3 receiver loops fetching from queue
+        max_in_flight: 100, // Up to 100 messages being processed concurrently
         processing_timeout: Duration::from_secs(120),
         heartbeat_interval: Duration::from_secs(30),
         restart_delay: Duration::from_secs(2),

@@ -6,11 +6,12 @@
 //! ## Features
 //!
 //! - **Generic Design**: Works with any queue system by implementing the [`MessageReceiver`] and [`MessageProcessor`] traits
-//! - **Configurable Workers**: Set worker count, processing timeouts, heartbeat intervals, and restart delays
-//! - **Fault Tolerance**: Workers automatically restart on crashes with configurable delays
+//! - **Semaphore-Based Concurrency**: Control maximum concurrent message processing with configurable limits
+//! - **High Throughput**: Multiple receiver loops continuously fetch messages without blocking
+//! - **Fault Tolerance**: Receivers automatically restart on crashes with configurable delays
 //! - **Timeout Handling**: Built-in timeout support for message processing
-//! - **Structured Logging**: Comprehensive tracing support with worker IDs and error details
-//! - **Concurrent Processing**: Process multiple messages concurrently within each worker
+//! - **Structured Logging**: Comprehensive tracing support with receiver IDs and error details
+//! - **Concurrent Processing**: Process hundreds of messages concurrently across few receiver loops
 //!
 //! ## Quick Start
 //!
@@ -53,18 +54,20 @@
 //! // 3. Create and configure the worker pool
 //! # async fn example() {
 //! let config = WorkerPoolConfig {
-//!     worker_count: 4,
+//!     receiver_count: 3,           // Number of receiver loops fetching from queue
+//!     max_in_flight: 100,          // Maximum concurrent message processing tasks
 //!     processing_timeout: Duration::from_secs(30),
 //!     heartbeat_interval: Duration::from_secs(60),
 //!     restart_delay: Duration::from_secs(5),
+//!     ..Default::default()
 //! };
 //!
 //! let pool = WorkerPool::new(MyReceiver, MyProcessor, config);
 //!
-//! // 4. Spawn workers (non-blocking)
+//! // 4. Spawn receiver loops (non-blocking)
 //! pool.spawn_workers::<String>();
 //!
-//! // Workers will run indefinitely until the program exits
+//! // Receivers will run indefinitely until the program exits
 //! # }
 //! ```
 //!
@@ -74,24 +77,37 @@
 //!
 //! - **[`MessageReceiver`]**: Defines how to receive messages from your queue system
 //! - **[`MessageProcessor`]**: Defines how to process individual messages
-//! - **[`WorkerPool`]**: Manages multiple workers that coordinate receiving and processing
+//! - **[`WorkerPool`]**: Manages multiple receiver loops with semaphore-based concurrency control
 //!
-//! Each worker runs in its own async task and continuously:
-//! 1. Receives messages from the queue
-//! 2. Processes them concurrently with timeouts
-//! 3. Logs heartbeats and errors
-//! 4. Automatically restarts on crashes
+//! ### How it Works
+//!
+//! Each receiver loop runs in its own async task and continuously:
+//! 1. Fetches messages from the queue (non-blocking)
+//! 2. Spawns processing tasks for each message (controlled by semaphore)
+//! 3. Immediately fetches more messages without waiting for processing to complete
+//! 4. Logs heartbeats showing available permits
+//! 5. Automatically restarts on crashes
+//!
+//! Processing tasks:
+//! 1. Acquire a semaphore permit (blocks if at `max_in_flight` limit)
+//! 2. Process the message with timeout
+//! 3. Release the permit automatically when done
+//!
+//! This architecture provides high throughput for I/O-bound tasks by decoupling
+//! message fetching from processing, allowing receivers to keep the processing
+//! pipeline full.
 //!
 //! ## Examples
 //!
 //! See the `examples/` directory for complete working examples, including:
 //! - AWS SQS integration (`examples/sqs_workers.rs`)
 
-use futures::{Future, StreamExt};
+use futures::Future;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::Semaphore;
 
 /// A trait for message receivers that can be used with the worker pool.
 ///
@@ -238,8 +254,8 @@ pub trait MessageProcessor<M> {
 
 /// Configuration for the worker pool
 ///
-/// This struct controls the behavior of the worker pool, including the number of workers,
-/// timeouts, and monitoring intervals.
+/// This struct controls the behavior of the worker pool, including the number of receiver loops,
+/// maximum concurrent processing tasks, timeouts, and monitoring intervals.
 ///
 /// # Examples
 ///
@@ -252,19 +268,34 @@ pub trait MessageProcessor<M> {
 ///
 /// // Or customize specific values
 /// let config = WorkerPoolConfig {
-///     worker_count: 8,
+///     receiver_count: 5,
+///     max_in_flight: 200,
 ///     processing_timeout: Duration::from_secs(120),
 ///     heartbeat_interval: Duration::from_secs(30),
 ///     restart_delay: Duration::from_secs(10),
+///     ..Default::default()
 /// };
 /// ```
 #[derive(Clone, Debug)]
 pub struct WorkerPoolConfig {
-    /// Number of workers to spawn
+    /// Number of receiver loops to spawn
     ///
-    /// Each worker runs in its own async task and processes messages independently.
-    /// More workers can increase throughput but also increase resource usage.
-    /// Default: 1
+    /// Each receiver loop continuously fetches messages from the queue and spawns
+    /// tasks to process them. More receivers can help ensure the queue is polled
+    /// frequently, but too many may cause contention.
+    /// Default: 3
+    pub receiver_count: u8,
+    /// Maximum number of messages being processed concurrently
+    ///
+    /// This controls the global concurrency limit across all receivers using a semaphore.
+    /// Higher values allow more parallel processing but consume more resources.
+    /// Default: 100
+    pub max_in_flight: usize,
+    /// Number of workers to spawn (DEPRECATED: use receiver_count instead)
+    ///
+    /// This field is deprecated and maintained for backwards compatibility.
+    /// It will be used as receiver_count if receiver_count is not explicitly set.
+    #[deprecated(since = "0.1.0", note = "use receiver_count instead")]
     pub worker_count: u8,
     /// Timeout duration for processing individual messages
     ///
@@ -289,7 +320,10 @@ pub struct WorkerPoolConfig {
 impl Default for WorkerPoolConfig {
     fn default() -> Self {
         Self {
-            worker_count: 1,
+            receiver_count: 3,
+            max_in_flight: 100,
+            #[allow(deprecated)]
+            worker_count: 3, // Set to same as receiver_count for backwards compatibility
             processing_timeout: Duration::from_secs(300), // 5 minutes
             heartbeat_interval: Duration::from_secs(60),  // 1 minute
             restart_delay: Duration::from_secs(5),        // 5 seconds
@@ -421,6 +455,8 @@ impl<R, P> WorkerPool<R, P> {
 
     /// Set the number of workers (builder pattern)
     ///
+    /// DEPRECATED: Use `with_receiver_count` instead.
+    ///
     /// # Parameters
     ///
     /// * `count` - Number of worker tasks to spawn
@@ -442,10 +478,13 @@ impl<R, P> WorkerPool<R, P> {
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
-    ///     .with_worker_count(8);
+    ///     .with_receiver_count(8);
     /// ```
+    #[deprecated(since = "0.1.0", note = "use with_receiver_count instead")]
+    #[allow(deprecated)]
     pub fn with_worker_count(mut self, count: u8) -> Self {
         self.config.worker_count = count;
+        self.config.receiver_count = count;
         self
     }
 
@@ -542,18 +581,81 @@ impl<R, P> WorkerPool<R, P> {
         self
     }
 
-    /// Spawn the configured number of workers
+    /// Set the number of receiver loops (builder pattern)
     ///
-    /// This method spawns the worker tasks and returns immediately. The workers will
-    /// run indefinitely in the background, continuously processing messages until the
-    /// program exits.
+    /// # Parameters
     ///
-    /// Each worker operates independently and will automatically restart if it crashes.
-    /// Workers log their activity using the `tracing` crate.
+    /// * `count` - Number of receiver loops to spawn
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use pollux::WorkerPool;
+    ///
+    /// # struct MyReceiver;
+    /// # struct MyProcessor;
+    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
+    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
+    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// # }
+    /// # impl pollux::MessageProcessor<String> for MyProcessor {
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// # }
+    ///
+    /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
+    ///     .with_receiver_count(5);
+    /// ```
+    pub fn with_receiver_count(mut self, count: u8) -> Self {
+        self.config.receiver_count = count;
+        self
+    }
+
+    /// Set the maximum number of concurrent messages (builder pattern)
+    ///
+    /// # Parameters
+    ///
+    /// * `max` - Maximum number of messages being processed concurrently
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use pollux::WorkerPool;
+    ///
+    /// # struct MyReceiver;
+    /// # struct MyProcessor;
+    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
+    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
+    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// # }
+    /// # impl pollux::MessageProcessor<String> for MyProcessor {
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// # }
+    ///
+    /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
+    ///     .with_max_in_flight(200);
+    /// ```
+    pub fn with_max_in_flight(mut self, max: usize) -> Self {
+        self.config.max_in_flight = max;
+        self
+    }
+
+    /// Spawn the configured number of receiver loops
+    ///
+    /// This method spawns the receiver tasks and returns immediately. The receivers will
+    /// run indefinitely in the background, continuously fetching and processing messages
+    /// until the program exits.
+    ///
+    /// Each receiver loop fetches messages from the queue and spawns tasks to process them.
+    /// The total number of concurrent message processing tasks is controlled by the
+    /// `max_in_flight` configuration using a shared semaphore.
+    ///
+    /// Receivers log their activity using the `tracing` crate.
     ///
     /// # Type Parameters
     ///
-    /// * `M` - The message type that workers will process
+    /// * `M` - The message type that will be processed
     ///
     /// # Examples
     ///
@@ -575,7 +677,7 @@ impl<R, P> WorkerPool<R, P> {
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor);
     /// pool.spawn_workers::<String>();
     ///
-    /// // Workers are now running in the background
+    /// // Receiver loops are now running in the background
     /// // Keep the main thread alive or wait for a signal
     /// // tokio::signal::ctrl_c().await.unwrap();
     /// # }
@@ -586,34 +688,44 @@ impl<R, P> WorkerPool<R, P> {
         P: MessageProcessor<M> + Send + Sync + 'static,
         M: Send + Sync + 'static,
     {
-        for worker_id in 0..self.config.worker_count {
+        // Create shared semaphore for controlling max concurrent message processing
+        let semaphore = Arc::new(Semaphore::new(self.config.max_in_flight));
+
+        tracing::info!(
+            receiver_count = self.config.receiver_count,
+            max_in_flight = self.config.max_in_flight,
+            "spawning receiver loops"
+        );
+
+        for worker_id in 0..self.config.receiver_count {
             let receiver = Arc::clone(&self.receiver);
             let processor = Arc::clone(&self.processor);
+            let semaphore = Arc::clone(&semaphore);
             let config = self.config.clone();
 
             tokio::spawn(async move {
-                tracing::info!(worker_id, "spawning worker");
-                run_worker_with_id(receiver, processor, config, worker_id).await;
+                tracing::info!(worker_id, "spawning receiver loop");
+                run_worker_with_id(receiver, processor, config, worker_id, semaphore).await;
             });
         }
     }
 
-    /// Run a single worker synchronously
+    /// Run a single receiver loop synchronously
     ///
-    /// This method runs a single worker and blocks until it completes (which should never
-    /// happen under normal circumstances since workers run indefinitely). This is primarily
-    /// useful for testing or when you want to manage worker lifecycles manually.
+    /// This method runs a single receiver loop and blocks until it completes (which should never
+    /// happen under normal circumstances since receivers run indefinitely). This is primarily
+    /// useful for testing or when you want to manage receiver lifecycles manually.
     ///
-    /// Most users should prefer [`spawn_workers`](Self::spawn_workers) which spawns workers
+    /// Most users should prefer [`spawn_workers`](Self::spawn_workers) which spawns receivers
     /// in background tasks.
     ///
     /// # Parameters
     ///
-    /// * `worker_id` - Unique identifier for this worker (used in logging)
+    /// * `worker_id` - Unique identifier for this receiver (used in logging)
     ///
     /// # Type Parameters
     ///
-    /// * `M` - The message type that the worker will process
+    /// * `M` - The message type that will be processed
     ///
     /// # Examples
     ///
@@ -646,16 +758,25 @@ impl<R, P> WorkerPool<R, P> {
     {
         let receiver = Arc::clone(&self.receiver);
         let processor = Arc::clone(&self.processor);
-        run_worker_with_id(receiver, processor, self.config.clone(), worker_id).await;
+        let semaphore = Arc::new(Semaphore::new(self.config.max_in_flight));
+        run_worker_with_id(
+            receiver,
+            processor,
+            self.config.clone(),
+            worker_id,
+            semaphore,
+        )
+        .await;
     }
 }
 
-#[tracing::instrument(skip(receiver, processor, config))]
+#[tracing::instrument(skip(receiver, processor, config, semaphore))]
 async fn run_worker_with_id<R, P, M>(
     receiver: Arc<R>,
     processor: Arc<P>,
     config: WorkerPoolConfig,
     worker_id: u8,
+    semaphore: Arc<Semaphore>,
 ) where
     R: MessageReceiver<M> + Send + Sync + 'static,
     P: MessageProcessor<M> + Send + Sync + 'static,
@@ -665,16 +786,23 @@ async fn run_worker_with_id<R, P, M>(
         let worker_result = tokio::spawn({
             let receiver = Arc::clone(&receiver);
             let processor = Arc::clone(&processor);
+            let semaphore = Arc::clone(&semaphore);
             let config = config.clone();
 
             async move {
-                tracing::info!(worker_id, "worker started");
+                tracing::info!(worker_id, "receiver loop started");
                 let mut last_heartbeat = Instant::now();
 
                 loop {
                     // Heartbeat logging
                     if last_heartbeat.elapsed() > config.heartbeat_interval {
-                        tracing::info!(worker_id, "worker heartbeat - still running");
+                        let available_permits = semaphore.available_permits();
+                        tracing::info!(
+                            worker_id,
+                            available_permits,
+                            max_in_flight = config.max_in_flight,
+                            "receiver heartbeat - still running"
+                        );
                         last_heartbeat = Instant::now();
                     }
 
@@ -685,53 +813,50 @@ async fn run_worker_with_id<R, P, M>(
                                 continue;
                             }
 
-                            // Process messages concurrently with timeout
-                            let results = futures::stream::iter(messages.iter())
-                                .then(|message| {
-                                    let processor = Arc::clone(&processor);
-                                    let timeout = config.processing_timeout;
+                            tracing::debug!(
+                                worker_id,
+                                message_count = messages.len(),
+                                available_permits = semaphore.available_permits(),
+                                "received messages batch"
+                            );
 
-                                    async move {
-                                        let result = tokio::time::timeout(
-                                            timeout,
-                                            processor.process_message(message),
-                                        )
-                                        .await;
+                            // Spawn a task for each message (controlled by semaphore)
+                            for message in messages {
+                                let processor = Arc::clone(&processor);
+                                let semaphore = Arc::clone(&semaphore);
+                                let timeout = config.processing_timeout;
 
-                                        match result {
-                                            Ok(Ok(_)) => Ok(()),
-                                            Ok(Err(e)) => {
-                                                tracing::error!(
-                                                    worker_id,
-                                                    error = ?e,
-                                                    "error processing message"
-                                                );
-                                                Err(e)
-                                            }
-                                            Err(_) => {
-                                                tracing::error!(
-                                                    worker_id,
-                                                    timeout_secs = timeout.as_secs(),
-                                                    "message processing timed out"
-                                                );
-                                                // Super simple - just convert string to Box<dyn Error>
-                                                Err("processing timeout".into())
-                                            }
+                                tokio::spawn(async move {
+                                    // Acquire semaphore permit (will wait if at max_in_flight)
+                                    let _permit =
+                                        semaphore.acquire().await.expect("semaphore closed");
+
+                                    // Process message with timeout
+                                    let result = tokio::time::timeout(
+                                        timeout,
+                                        processor.process_message(&message),
+                                    )
+                                    .await;
+
+                                    match result {
+                                        Ok(Ok(_)) => {
+                                            tracing::trace!("message processed successfully");
+                                        }
+                                        Ok(Err(e)) => {
+                                            tracing::error!(
+                                                error = ?e,
+                                                "error processing message"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            tracing::error!(
+                                                timeout_secs = timeout.as_secs(),
+                                                "message processing timed out"
+                                            );
                                         }
                                     }
-                                })
-                                .collect::<Vec<Result<(), Box<dyn std::error::Error + Send + Sync>>>>()
-                                .await;
-
-                            // Count and log errors
-                            let error_count = results.iter().filter(|r| r.is_err()).count();
-                            if error_count > 0 {
-                                tracing::warn!(
-                                    worker_id,
-                                    error_count,
-                                    total_messages = messages.len(),
-                                    "some messages failed to process"
-                                );
+                                    // Permit is automatically released when _permit is dropped
+                                });
                             }
                         }
                         Err(e) => {
@@ -752,15 +877,15 @@ async fn run_worker_with_id<R, P, M>(
         match worker_result {
             Ok(_) => {
                 // This should never be hit since the inner loop is infinite
-                tracing::error!(worker_id, "worker exited successfully?");
+                tracing::error!(worker_id, "receiver loop exited successfully?");
             }
             Err(e) => {
-                tracing::error!(worker_id, error = ?e, "worker crashed with error");
+                tracing::error!(worker_id, error = ?e, "receiver loop crashed with error");
             }
         }
 
         // Add delay before restarting to avoid rapid restart loops
-        tracing::info!(worker_id, "worker restarting...");
+        tracing::info!(worker_id, "receiver loop restarting...");
         tokio::time::sleep(config.restart_delay).await;
     }
 }
