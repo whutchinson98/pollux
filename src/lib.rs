@@ -325,12 +325,6 @@ pub struct WorkerPoolConfig {
     /// Higher values allow more parallel processing but consume more resources.
     /// Default: 100
     pub max_in_flight: usize,
-    /// Number of workers to spawn (DEPRECATED: use receiver_count instead)
-    ///
-    /// This field is deprecated and maintained for backwards compatibility.
-    /// It will be used as receiver_count if receiver_count is not explicitly set.
-    #[deprecated(since = "0.1.0", note = "use receiver_count instead")]
-    pub worker_count: u8,
     /// Timeout duration for processing individual messages
     ///
     /// If a message takes longer than this duration to process, it will be cancelled
@@ -356,8 +350,6 @@ impl Default for WorkerPoolConfig {
         Self {
             receiver_count: 3,
             max_in_flight: 100,
-            #[allow(deprecated)]
-            worker_count: 3, // Set to same as receiver_count for backwards compatibility
             processing_timeout: Duration::from_secs(300), // 5 minutes
             heartbeat_interval: Duration::from_secs(60),  // 1 minute
             restart_delay: Duration::from_secs(5),        // 5 seconds
@@ -491,43 +483,6 @@ impl<R, P> WorkerPool<R, P> {
     /// ```
     pub fn with_defaults(receiver: R, processor: P) -> Self {
         Self::new(receiver, processor, WorkerPoolConfig::default())
-    }
-
-    /// Set the number of workers (builder pattern)
-    ///
-    /// DEPRECATED: Use `with_receiver_count` instead.
-    ///
-    /// # Parameters
-    ///
-    /// * `count` - Number of worker tasks to spawn
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use pollux::{WorkerPool, MessageEnvelope};
-    ///
-    /// # struct MyReceiver;
-    /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver for MyReceiver {
-    /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     type Payload = String;
-    /// #     type AckInfo = String;
-    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
-    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
-    /// # }
-    /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-    /// # }
-    ///
-    /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
-    ///     .with_receiver_count(8);
-    /// ```
-    #[deprecated(since = "0.1.0", note = "use with_receiver_count instead")]
-    #[allow(deprecated)]
-    pub fn with_worker_count(mut self, count: u8) -> Self {
-        self.config.worker_count = count;
-        self.config.receiver_count = count;
-        self
     }
 
     /// Set the processing timeout (builder pattern)
