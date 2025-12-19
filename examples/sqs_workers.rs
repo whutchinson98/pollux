@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::Context;
 use pollux::{MessageProcessor, MessageReceiver, WorkerPool, WorkerPoolConfig};
@@ -83,19 +83,13 @@ impl MessageReceiver<aws_sdk_sqs::types::Message> for SQSWorker {
     }
 }
 
-pub struct ProcessorContext {
-    sqs_worker: SQSWorker,
-}
-
-pub struct MessageProcessorImpl {
-    context: Arc<ProcessorContext>,
-}
+pub struct MessageProcessorImpl;
 
 impl MessageProcessor<aws_sdk_sqs::types::Message> for MessageProcessorImpl {
     async fn process_message(
         &self,
         message: &aws_sdk_sqs::types::Message,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(body) = message.body.as_ref() {
             println!("Processing message: {:?}", body);
             let wait_time = body.parse::<u64>().unwrap();
@@ -103,14 +97,7 @@ impl MessageProcessor<aws_sdk_sqs::types::Message> for MessageProcessorImpl {
             println!("Done processing message: {:?}", body);
         }
 
-        if let Some(receipt_handle) = message.receipt_handle.as_ref() {
-            self.context
-                .sqs_worker
-                .delete_message(receipt_handle)
-                .await?;
-        }
-
-        Ok(())
+        Ok(message.receipt_handle.clone())
     }
 }
 
@@ -140,11 +127,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("initialized sqs worker");
 
-    let message_processor = MessageProcessorImpl {
-        context: Arc::new(ProcessorContext {
-            sqs_worker: sqs_worker.clone(),
-        }),
-    };
+    let message_processor = MessageProcessorImpl {};
 
     let worker_pool_config = WorkerPoolConfig {
         receiver_count: 3,  // 3 receiver loops fetching from queue

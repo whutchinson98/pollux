@@ -44,10 +44,10 @@
 //!     async fn process_message(
 //!         &self,
 //!         message: &String,
-//!     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//!     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
 //!         // Your message processing logic here
 //!         println!("Processing: {}", message);
-//!         Ok(())
+//!         Ok(Some("receipt_handle".to_string()))
 //!     }
 //! }
 //!
@@ -218,7 +218,7 @@ pub trait MessageReceiver<M> {
 ///     async fn process_message(
 ///         &self,
 ///         message: &String,
-///     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
 ///         // Your business logic here
 ///         println!("Processing message: {}", message);
 ///         
@@ -227,7 +227,7 @@ pub trait MessageReceiver<M> {
 ///             return Err("Message contains error".into());
 ///         }
 ///         
-///         Ok(())
+///         Ok(Some("receipt_handle".to_string()))
 ///     }
 /// }
 /// ```
@@ -244,12 +244,12 @@ pub trait MessageProcessor<M> {
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - Message was processed successfully
+    /// * `Ok(Option<String>)` - Message was processed successfully. Returns the receipt handle of the message if it exists to clean up
     /// * `Err(Box<dyn std::error::Error + Send + Sync>)` - Processing failed
     fn process_message(
         &self,
         message: &M,
-    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
+    ) -> impl Future<Output = Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>> + Send;
 }
 
 /// Configuration for the worker pool
@@ -356,7 +356,7 @@ impl Default for WorkerPoolConfig {
 /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
 /// # }
 /// # impl pollux::MessageProcessor<String> for MyProcessor {
-/// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+/// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
 /// # }
 ///
 /// // Create a worker pool with custom configuration
@@ -402,7 +402,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// let config = WorkerPoolConfig {
@@ -444,7 +444,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor);
@@ -474,7 +474,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -508,7 +508,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -539,7 +539,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -570,7 +570,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -600,7 +600,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -630,7 +630,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -670,7 +670,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// # async fn example() {
@@ -740,7 +740,7 @@ impl<R, P> WorkerPool<R, P> {
     /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
     /// # }
     ///
     /// # async fn example() {
@@ -822,6 +822,7 @@ async fn run_worker_with_id<R, P, M>(
 
                             // Spawn a task for each message (controlled by semaphore)
                             for message in messages {
+                                let receiver = Arc::clone(&receiver);
                                 let processor = Arc::clone(&processor);
                                 let semaphore = Arc::clone(&semaphore);
                                 let timeout = config.processing_timeout;
@@ -839,8 +840,13 @@ async fn run_worker_with_id<R, P, M>(
                                     .await;
 
                                     match result {
-                                        Ok(Ok(_)) => {
+                                        Ok(Ok(receipt_handle)) => {
                                             tracing::trace!("message processed successfully");
+                                            if let Some(receipt_handle) = receipt_handle {
+                                                let _ = receiver.delete_message(receipt_handle).await.inspect_err(|e| {
+                                                    tracing::error!(error=?e, "unable to delete message");
+                                                });
+                                            }
                                         }
                                         Ok(Err(e)) => {
                                             tracing::error!(
