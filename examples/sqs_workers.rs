@@ -77,6 +77,7 @@ impl MessageReceiver for SQSWorker {
     async fn receive_messages(
         &self,
     ) -> Result<Vec<pollux::MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> {
+        println!("RECEVING");
         let messages = self.receive_messages().await?;
 
         // Convert SQS messages to MessageEnvelopes
@@ -144,12 +145,11 @@ async fn main() -> anyhow::Result<()> {
     let message_processor = MessageProcessorImpl {};
 
     let worker_pool_config = WorkerPoolConfig {
-        receiver_count: 3,  // 3 receiver loops fetching from queue
-        max_in_flight: 100, // Up to 100 messages being processed concurrently
+        receiver_count: 3, // 3 receiver loops fetching from queue
+        max_in_flight: 3,  // Up to 100 messages being processed concurrently
         processing_timeout: Duration::from_secs(120),
         heartbeat_interval: Duration::from_secs(30),
         restart_delay: Duration::from_secs(2),
-        ..Default::default()
     };
 
     let worker_pool = WorkerPool::new(sqs_worker, message_processor, worker_pool_config);

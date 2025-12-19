@@ -79,25 +79,29 @@
 //!
 //! - **[`MessageReceiver`]**: Defines how to receive messages from your queue system
 //! - **[`MessageProcessor`]**: Defines how to process individual messages
-//! - **[`WorkerPool`]**: Manages multiple receiver loops with semaphore-based concurrency control
+//! - **[`WorkerPool`]**: Manages multiple receiver loops with channel-based worker pool
 //!
 //! ### How it Works
 //!
 //! Each receiver loop runs in its own async task and continuously:
-//! 1. Fetches messages from the queue (non-blocking)
-//! 2. Spawns processing tasks for each message (controlled by semaphore)
-//! 3. Immediately fetches more messages without waiting for processing to complete
-//! 4. Logs heartbeats showing available permits
-//! 5. Automatically restarts on crashes
+//! 1. Spawns a fixed pool of `max_in_flight` worker tasks at startup
+//! 2. Fetches messages from the queue (non-blocking)
+//! 3. Distributes messages to worker tasks via mpsc channels (round-robin)
+//! 4. Receives completion notifications from workers
+//! 5. Acknowledges successfully processed messages
+//! 6. Logs heartbeats showing available workers
+//! 7. Automatically restarts on crashes
 //!
-//! Processing tasks:
-//! 1. Acquire a semaphore permit (blocks if at `max_in_flight` limit)
+//! Worker tasks:
+//! 1. Wait on their channel to receive work
 //! 2. Process the message with timeout
-//! 3. Release the permit automatically when done
+//! 3. Send completion notification back to main loop
+//! 4. Wait for next message
 //!
-//! This architecture provides high throughput for I/O-bound tasks by decoupling
-//! message fetching from processing, allowing receivers to keep the processing
-//! pipeline full.
+//! This architecture provides high throughput and predictable resource usage by:
+//! - Using a fixed pool of workers (no unbounded task spawning)
+//! - Decoupling message fetching from processing
+//! - Allowing the main loop to control acknowledgments based on processing results
 //!
 //! ## Examples
 //!
@@ -109,7 +113,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 
 /// A message envelope that wraps the message payload with acknowledgment information.
 ///
@@ -654,9 +658,9 @@ impl<R, P> WorkerPool<R, P> {
     /// run indefinitely in the background, continuously fetching and processing messages
     /// until the program exits.
     ///
-    /// Each receiver loop fetches messages from the queue and spawns tasks to process them.
-    /// The total number of concurrent message processing tasks is controlled by the
-    /// `max_in_flight` configuration using a shared semaphore.
+    /// Each receiver loop fetches messages from the queue and distributes them to a fixed
+    /// pool of worker tasks via mpsc channels. The total number of concurrent message
+    /// processing tasks equals `max_in_flight`.
     ///
     /// Receivers log their activity using the `tracing` crate.
     ///
@@ -694,9 +698,6 @@ impl<R, P> WorkerPool<R, P> {
         R::Payload: Send + Sync + 'static,
         R::AckInfo: Send + Sync + 'static,
     {
-        // Create shared semaphore for controlling max concurrent message processing
-        let semaphore = Arc::new(Semaphore::new(self.config.max_in_flight));
-
         tracing::info!(
             receiver_count = self.config.receiver_count,
             max_in_flight = self.config.max_in_flight,
@@ -706,12 +707,11 @@ impl<R, P> WorkerPool<R, P> {
         for worker_id in 0..self.config.receiver_count {
             let receiver = Arc::clone(&self.receiver);
             let processor = Arc::clone(&self.processor);
-            let semaphore = Arc::clone(&semaphore);
             let config = self.config.clone();
 
             tokio::spawn(async move {
                 tracing::info!(worker_id, "spawning receiver loop");
-                run_worker_with_id(receiver, processor, config, worker_id, semaphore).await;
+                run_worker_with_id(receiver, processor, config, worker_id).await;
             });
         }
     }
@@ -763,25 +763,27 @@ impl<R, P> WorkerPool<R, P> {
     {
         let receiver = Arc::clone(&self.receiver);
         let processor = Arc::clone(&self.processor);
-        let semaphore = Arc::new(Semaphore::new(self.config.max_in_flight));
-        run_worker_with_id(
-            receiver,
-            processor,
-            self.config.clone(),
-            worker_id,
-            semaphore,
-        )
-        .await;
+        run_worker_with_id(receiver, processor, self.config.clone(), worker_id).await;
     }
 }
 
-#[tracing::instrument(skip(receiver, processor, config, semaphore))]
+/// Message sent to worker tasks for processing
+struct WorkMessage<P, A> {
+    envelope: MessageEnvelope<P, A>,
+}
+
+/// Completion notification from worker tasks
+struct CompletionMessage<A> {
+    ack_info: A,
+    success: bool,
+}
+
+#[tracing::instrument(skip(receiver, processor, config))]
 async fn run_worker_with_id<R, P>(
     receiver: Arc<R>,
     processor: Arc<P>,
     config: WorkerPoolConfig,
     worker_id: u8,
-    semaphore: Arc<Semaphore>,
 ) where
     R: MessageReceiver + Send + Sync + 'static,
     P: MessageProcessor<R::Payload> + Send + Sync + 'static,
@@ -792,27 +794,123 @@ async fn run_worker_with_id<R, P>(
         let worker_result = tokio::spawn({
             let receiver = Arc::clone(&receiver);
             let processor = Arc::clone(&processor);
-            let semaphore = Arc::clone(&semaphore);
             let config = config.clone();
 
             async move {
                 tracing::info!(worker_id, "receiver loop started");
+
+                // Create completion channel for workers to send back results
+                let (completion_tx, mut completion_rx) =
+                    mpsc::channel::<CompletionMessage<R::AckInfo>>(config.max_in_flight * 2);
+
+                // Create work channels and spawn worker tasks
+                let mut work_senders = Vec::new();
+                for task_id in 0..config.max_in_flight {
+                    let (work_tx, mut work_rx) =
+                        mpsc::channel::<WorkMessage<R::Payload, R::AckInfo>>(1);
+                    work_senders.push(work_tx);
+
+                    let processor = Arc::clone(&processor);
+                    let completion_tx = completion_tx.clone();
+                    let timeout = config.processing_timeout;
+
+                    // Spawn worker task
+                    tokio::spawn(async move {
+                        tracing::debug!(worker_id, task_id, "worker task started");
+
+                        while let Some(work_msg) = work_rx.recv().await {
+                            let MessageEnvelope { payload, ack_info } = work_msg.envelope;
+
+                            // Process message with timeout
+                            let result =
+                                tokio::time::timeout(timeout, processor.process_message(&payload))
+                                    .await;
+
+                            let success = match result {
+                                Ok(Ok(())) => {
+                                    tracing::trace!(task_id, "message processed successfully");
+                                    true
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::error!(
+                                        task_id,
+                                        error = ?e,
+                                        "error processing message"
+                                    );
+                                    false
+                                }
+                                Err(_) => {
+                                    tracing::error!(
+                                        task_id,
+                                        timeout_secs = timeout.as_secs(),
+                                        "message processing timed out"
+                                    );
+                                    false
+                                }
+                            };
+
+                            // Send completion notification
+                            let _ = completion_tx
+                                .send(CompletionMessage { ack_info, success })
+                                .await;
+                        }
+                    });
+                }
+
                 let mut last_heartbeat = Instant::now();
+                let mut next_worker_idx = 0;
+                let mut in_flight_count = 0;
 
                 loop {
                     // Heartbeat logging
                     if last_heartbeat.elapsed() > config.heartbeat_interval {
-                        let available_permits = semaphore.available_permits();
+                        let available_workers = config.max_in_flight - in_flight_count;
                         tracing::info!(
                             worker_id,
-                            available_permits,
+                            available_workers,
+                            in_flight = in_flight_count,
                             max_in_flight = config.max_in_flight,
                             "receiver heartbeat - still running"
                         );
                         last_heartbeat = Instant::now();
                     }
 
-                    // Receive messages
+                    // Process any completion messages first
+                    while let Ok(completion) = completion_rx.try_recv() {
+                        in_flight_count = in_flight_count.saturating_sub(1);
+
+                        if completion.success {
+                            if let Err(e) = receiver.acknowledge(completion.ack_info).await {
+                                tracing::error!(
+                                    worker_id,
+                                    error = ?e,
+                                    "unable to acknowledge message"
+                                );
+                            }
+                        }
+                    }
+
+                    // Check if we have capacity to process messages before fetching
+                    if in_flight_count >= config.max_in_flight {
+                        tracing::debug!(worker_id, "all workers busy, waiting for completions");
+                        // Wait for at least one completion
+                        if let Some(completion) = completion_rx.recv().await {
+                            in_flight_count = in_flight_count.saturating_sub(1);
+
+                            if completion.success {
+                                if let Err(e) = receiver.acknowledge(completion.ack_info).await {
+                                    tracing::error!(
+                                        worker_id,
+                                        error = ?e,
+                                        "unable to acknowledge message"
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Receive messages from queue
                     match receiver.receive_messages().await {
                         Ok(envelopes) => {
                             if envelopes.is_empty() {
@@ -822,53 +920,28 @@ async fn run_worker_with_id<R, P>(
                             tracing::debug!(
                                 worker_id,
                                 message_count = envelopes.len(),
-                                available_permits = semaphore.available_permits(),
+                                available_workers = config.max_in_flight - in_flight_count,
                                 "received messages batch"
                             );
 
-                            // Spawn a task for each message (controlled by semaphore)
+                            // Distribute messages to worker tasks
                             for envelope in envelopes {
-                                let receiver = Arc::clone(&receiver);
-                                let processor = Arc::clone(&processor);
-                                let semaphore = Arc::clone(&semaphore);
-                                let timeout = config.processing_timeout;
+                                // Find next available worker (round-robin)
+                                let work_sender =
+                                    &work_senders[next_worker_idx % work_senders.len()];
+                                next_worker_idx = next_worker_idx.wrapping_add(1);
 
-                                tokio::spawn(async move {
-                                    // Acquire semaphore permit (will wait if at max_in_flight)
-                                    let _permit =
-                                        semaphore.acquire().await.expect("semaphore closed");
+                                // Send work to worker task
+                                if work_sender.send(WorkMessage { envelope }).await.is_ok() {
+                                    in_flight_count += 1;
+                                } else {
+                                    tracing::error!(worker_id, "worker task channel closed");
+                                }
 
-                                    let MessageEnvelope { payload, ack_info } = envelope;
-
-                                    // Process message with timeout
-                                    let result = tokio::time::timeout(
-                                        timeout,
-                                        processor.process_message(&payload),
-                                    )
-                                    .await;
-
-                                    match result {
-                                        Ok(Ok(())) => {
-                                            tracing::trace!("message processed successfully");
-                                            let _ = receiver.acknowledge(ack_info).await.inspect_err(|e| {
-                                                tracing::error!(error=?e, "unable to acknowledge message");
-                                            });
-                                        }
-                                        Ok(Err(e)) => {
-                                            tracing::error!(
-                                                error = ?e,
-                                                "error processing message"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            tracing::error!(
-                                                timeout_secs = timeout.as_secs(),
-                                                "message processing timed out"
-                                            );
-                                        }
-                                    }
-                                    // Permit is automatically released when _permit is dropped
-                                });
+                                // Stop if we've reached max capacity
+                                if in_flight_count >= config.max_in_flight {
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
