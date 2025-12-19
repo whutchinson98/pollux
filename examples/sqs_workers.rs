@@ -69,17 +69,31 @@ impl SQSWorker {
     }
 }
 
-impl MessageReceiver<aws_sdk_sqs::types::Message> for SQSWorker {
+impl MessageReceiver for SQSWorker {
     type Error = anyhow::Error;
-    async fn receive_messages(&self) -> Result<Vec<aws_sdk_sqs::types::Message>, Self::Error> {
-        self.receive_messages().await
+    type Payload = aws_sdk_sqs::types::Message;
+    type AckInfo = String;
+
+    async fn receive_messages(
+        &self,
+    ) -> Result<Vec<pollux::MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> {
+        let messages = self.receive_messages().await?;
+
+        // Convert SQS messages to MessageEnvelopes
+        let envelopes = messages
+            .into_iter()
+            .filter_map(|msg| {
+                msg.receipt_handle
+                    .clone()
+                    .map(|receipt| pollux::MessageEnvelope::new(msg, receipt))
+            })
+            .collect();
+
+        Ok(envelopes)
     }
 
-    async fn delete_message<S>(&self, receipt_handle: S) -> Result<(), Self::Error>
-    where
-        S: AsRef<str> + std::fmt::Debug + Send,
-    {
-        self.delete_message(receipt_handle.as_ref()).await
+    async fn acknowledge(&self, ack_info: Self::AckInfo) -> Result<(), Self::Error> {
+        self.delete_message(&ack_info).await
     }
 }
 
@@ -89,7 +103,7 @@ impl MessageProcessor<aws_sdk_sqs::types::Message> for MessageProcessorImpl {
     async fn process_message(
         &self,
         message: &aws_sdk_sqs::types::Message,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(body) = message.body.as_ref() {
             println!("Processing message: {:?}", body);
             let wait_time = body.parse::<u64>().unwrap();
@@ -97,7 +111,7 @@ impl MessageProcessor<aws_sdk_sqs::types::Message> for MessageProcessorImpl {
             println!("Done processing message: {:?}", body);
         }
 
-        Ok(message.receipt_handle.clone())
+        Ok(())
     }
 }
 

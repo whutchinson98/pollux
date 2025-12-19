@@ -16,24 +16,26 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use pollux::{MessageReceiver, MessageProcessor, WorkerPool, WorkerPoolConfig};
+//! use pollux::{MessageReceiver, MessageProcessor, MessageEnvelope, WorkerPool, WorkerPoolConfig};
 //! use std::time::Duration;
 //!
 //! // 1. Implement MessageReceiver for your queue system
 //! struct MyReceiver;
-//! impl MessageReceiver<String> for MyReceiver {
+//! impl MessageReceiver for MyReceiver {
 //!     type Error = Box<dyn std::error::Error + Send + Sync>;
+//!     type Payload = String;
+//!     type AckInfo = String;  // SQS uses String receipt handles
 //!
-//!     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> {
+//!     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> {
 //!         // Your queue receiving logic here
-//!         Ok(vec!["message1".to_string(), "message2".to_string()])
+//!         let envelope1 = MessageEnvelope::new("message1".to_string(), "receipt_1".to_string());
+//!         let envelope2 = MessageEnvelope::new("message2".to_string(), "receipt_2".to_string());
+//!         Ok(vec![envelope1, envelope2])
 //!     }
 //!
-//!     async fn delete_message<S>(&self, receipt_handle: S) -> Result<(), Self::Error>
-//!     where
-//!         S: AsRef<str> + std::fmt::Debug + Send,
-//!     {
-//!         // Your message deletion logic here
+//!     async fn acknowledge(&self, ack_info: Self::AckInfo) -> Result<(), Self::Error> {
+//!         // Your message acknowledgment logic here
+//!         println!("Acknowledging: {}", ack_info);
 //!         Ok(())
 //!     }
 //! }
@@ -43,11 +45,11 @@
 //! impl MessageProcessor<String> for MyProcessor {
 //!     async fn process_message(
 //!         &self,
-//!         message: &String,
-//!     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+//!         payload: &String,
+//!     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //!         // Your message processing logic here
-//!         println!("Processing: {}", message);
-//!         Ok(Some("receipt_handle".to_string()))
+//!         println!("Processing: {}", payload);
+//!         Ok(())
 //!     }
 //! }
 //!
@@ -65,7 +67,7 @@
 //! let pool = WorkerPool::new(MyReceiver, MyProcessor, config);
 //!
 //! // 4. Spawn receiver loops (non-blocking)
-//! pool.spawn_workers::<String>();
+//! pool.spawn_workers();
 //!
 //! // Receivers will run indefinitely until the program exits
 //! # }
@@ -109,79 +111,110 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+/// A message envelope that wraps the message payload with acknowledgment information.
+///
+/// This struct decouples the message content from the queue-specific acknowledgment
+/// mechanism, allowing different queue systems to use their own acknowledgment types
+/// (e.g., SQS uses String receipt handles, RabbitMQ uses u64 delivery tags).
+///
+/// # Type Parameters
+///
+/// * `P` - The message payload type
+/// * `A` - The acknowledgment information type
+#[derive(Debug, Clone)]
+pub struct MessageEnvelope<P, A> {
+    /// The actual message payload to be processed
+    pub payload: P,
+    /// Queue-specific acknowledgment information (e.g., receipt handle, delivery tag)
+    pub ack_info: A,
+}
+
+impl<P, A> MessageEnvelope<P, A> {
+    /// Create a new message envelope
+    pub fn new(payload: P, ack_info: A) -> Self {
+        Self { payload, ack_info }
+    }
+}
+
 /// A trait for message receivers that can be used with the worker pool.
 ///
 /// Implement this trait to integrate your queue system (SQS, RabbitMQ, Redis, etc.)
-/// with the worker pool. The trait provides methods to receive messages and delete
+/// with the worker pool. The trait provides methods to receive messages and acknowledge
 /// them after successful processing.
 ///
 /// # Type Parameters
 ///
-/// * `M` - The message type that will be received from the queue
+/// * `Payload` - The message payload type that will be processed
+/// * `AckInfo` - The acknowledgment information type (e.g., receipt handle, delivery tag)
 ///
 /// # Examples
 ///
 /// ```rust
-/// use pollux::MessageReceiver;
+/// use pollux::{MessageReceiver, MessageEnvelope};
 ///
 /// struct MyQueueReceiver {
 ///     queue_url: String,
 /// }
 ///
-/// impl MessageReceiver<String> for MyQueueReceiver {
+/// impl MessageReceiver for MyQueueReceiver {
 ///     type Error = Box<dyn std::error::Error + Send + Sync>;
+///     type Payload = String;
+///     type AckInfo = String;
 ///
-///     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> {
+///     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> {
 ///         // Implementation to receive messages from your queue
-///         Ok(vec!["message1".to_string()])
+///         let envelope = MessageEnvelope::new("message1".to_string(), "receipt_handle_123".to_string());
+///         Ok(vec![envelope])
 ///     }
 ///
-///     async fn delete_message<S>(&self, receipt_handle: S) -> Result<(), Self::Error>
-///     where
-///         S: AsRef<str> + std::fmt::Debug + Send,
-///     {
-///         // Implementation to delete/acknowledge the message
-///         println!("Deleting message with handle: {}", receipt_handle.as_ref());
+///     async fn acknowledge(&self, ack_info: Self::AckInfo) -> Result<(), Self::Error> {
+///         // Implementation to acknowledge/delete the message
+///         println!("Acknowledging message with handle: {}", ack_info);
 ///         Ok(())
 ///     }
 /// }
 /// ```
-pub trait MessageReceiver<M> {
+pub trait MessageReceiver {
     type Error: std::fmt::Display + std::fmt::Debug + Send + Sync + 'static;
+    type Payload: Send + Sync + 'static;
+    type AckInfo: Send + Sync + 'static;
 
     /// Receive messages from the source (queue, stream, etc.)
     ///
-    /// This method should return a batch of messages from your queue system.
+    /// This method should return a batch of message envelopes from your queue system.
     /// It's called continuously by workers, so it should handle cases where
     /// no messages are available (return empty Vec) and implement appropriate
     /// polling/waiting behavior.
     ///
     /// # Returns
     ///
-    /// * `Ok(Vec<M>)` - A vector of messages to process (can be empty)
+    /// * `Ok(Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>)` - A vector of message envelopes to process (can be empty)
     /// * `Err(Self::Error)` - An error occurred while receiving messages
-    fn receive_messages(&self) -> impl Future<Output = Result<Vec<M>, Self::Error>> + Send;
+    #[allow(clippy::type_complexity)]
+    fn receive_messages(
+        &self,
+    ) -> impl Future<
+        Output = Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error>,
+    > + Send;
 
-    /// Delete a given message after it's been processed.
+    /// Acknowledge a message after it's been successfully processed.
     ///
     /// This method is called after a message has been successfully processed
-    /// to remove it from the queue or mark it as acknowledged. The receipt_handle
-    /// is typically provided by the queue system when the message was received.
+    /// to remove it from the queue or mark it as acknowledged. The ack_info
+    /// is provided by the queue system when the message was received.
     ///
     /// # Parameters
     ///
-    /// * `receipt_handle` - A handle or identifier for the message to delete
+    /// * `ack_info` - Queue-specific acknowledgment information
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - Message was successfully deleted
-    /// * `Err(Self::Error)` - An error occurred while deleting the message
-    fn delete_message<S>(
+    /// * `Ok(())` - Message was successfully acknowledged
+    /// * `Err(Self::Error)` - An error occurred while acknowledging the message
+    fn acknowledge(
         &self,
-        receipt_handle: S,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
-    where
-        S: AsRef<str> + std::fmt::Debug + Send;
+        ack_info: Self::AckInfo,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// A trait for message processors that defines how to handle individual messages.
@@ -192,13 +225,14 @@ pub trait MessageReceiver<M> {
 ///
 /// # Type Parameters
 ///
-/// * `M` - The message type that will be processed
+/// * `P` - The message payload type that will be processed
 ///
 /// # Error Handling
 ///
 /// Processing errors are automatically logged by the worker pool. Failed messages
-/// do not cause the worker to crash - instead, errors are logged and the worker
-/// continues processing other messages.
+/// will NOT be acknowledged, allowing them to be redelivered based on the queue's
+/// visibility timeout or retry settings. Successful processing results in automatic
+/// acknowledgment.
 ///
 /// # Timeouts
 ///
@@ -217,22 +251,22 @@ pub trait MessageReceiver<M> {
 /// impl MessageProcessor<String> for MyProcessor {
 ///     async fn process_message(
 ///         &self,
-///         message: &String,
-///     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+///         payload: &String,
+///     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///         // Your business logic here
-///         println!("Processing message: {}", message);
-///         
+///         println!("Processing message: {}", payload);
+///
 ///         // Example: parse JSON, save to database, call external API, etc.
-///         if message.contains("error") {
+///         if payload.contains("error") {
 ///             return Err("Message contains error".into());
 ///         }
-///         
-///         Ok(Some("receipt_handle".to_string()))
+///
+///         Ok(())
 ///     }
 /// }
 /// ```
-pub trait MessageProcessor<M> {
-    /// Process a single message
+pub trait MessageProcessor<P> {
+    /// Process a single message payload
     ///
     /// This method contains your business logic for handling a message.
     /// It should be idempotent when possible, as messages may be retried
@@ -240,16 +274,16 @@ pub trait MessageProcessor<M> {
     ///
     /// # Parameters
     ///
-    /// * `message` - The message to process
+    /// * `payload` - The message payload to process
     ///
     /// # Returns
     ///
-    /// * `Ok(Option<String>)` - Message was processed successfully. Returns the receipt handle of the message if it exists to clean up
-    /// * `Err(Box<dyn std::error::Error + Send + Sync>)` - Processing failed
+    /// * `Ok(())` - Message was processed successfully and will be acknowledged
+    /// * `Err(Box<dyn std::error::Error + Send + Sync>)` - Processing failed, message will not be acknowledged
     fn process_message(
         &self,
-        message: &M,
-    ) -> impl Future<Output = Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>> + Send;
+        payload: &P,
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
 }
 
 /// Configuration for the worker pool
@@ -345,23 +379,25 @@ impl Default for WorkerPoolConfig {
 /// # Examples
 ///
 /// ```rust
-/// use pollux::{WorkerPool, WorkerPoolConfig};
+/// use pollux::{WorkerPool, WorkerPoolConfig, MessageEnvelope};
 /// use std::time::Duration;
 ///
 /// # struct MyReceiver;
 /// # struct MyProcessor;
-/// # impl pollux::MessageReceiver<String> for MyReceiver {
+/// # impl pollux::MessageReceiver for MyReceiver {
 /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-/// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-/// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+/// #     type Payload = String;
+/// #     type AckInfo = String;
+/// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+/// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
 /// # }
 /// # impl pollux::MessageProcessor<String> for MyProcessor {
-/// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+/// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
 /// # }
 ///
 /// // Create a worker pool with custom configuration
 /// let config = WorkerPoolConfig {
-///     worker_count: 4,
+///     receiver_count: 4,
 ///     processing_timeout: Duration::from_secs(60),
 ///     ..Default::default()
 /// };
@@ -370,7 +406,7 @@ impl Default for WorkerPoolConfig {
 ///
 /// // Or use the builder pattern
 /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
-///     .with_worker_count(8)
+///     .with_receiver_count(8)
 ///     .with_processing_timeout(Duration::from_secs(30));
 /// ```
 pub struct WorkerPool<R, P> {
@@ -391,22 +427,24 @@ impl<R, P> WorkerPool<R, P> {
     /// # Examples
     ///
     /// ```rust
-    /// use pollux::{WorkerPool, WorkerPoolConfig};
+    /// use pollux::{WorkerPool, WorkerPoolConfig, MessageEnvelope};
     /// use std::time::Duration;
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// let config = WorkerPoolConfig {
-    ///     worker_count: 4,
+    ///     receiver_count: 4,
     ///     processing_timeout: Duration::from_secs(120),
     ///     ..Default::default()
     /// };
@@ -434,17 +472,19 @@ impl<R, P> WorkerPool<R, P> {
     /// # Examples
     ///
     /// ```rust
-    /// use pollux::WorkerPool;
+    /// use pollux::{WorkerPool, MessageEnvelope};
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor);
@@ -464,17 +504,19 @@ impl<R, P> WorkerPool<R, P> {
     /// # Examples
     ///
     /// ```rust
-    /// use pollux::WorkerPool;
+    /// use pollux::{WorkerPool, MessageEnvelope};
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -497,18 +539,20 @@ impl<R, P> WorkerPool<R, P> {
     /// # Examples
     ///
     /// ```rust
-    /// use pollux::WorkerPool;
+    /// use pollux::{WorkerPool, MessageEnvelope};
     /// use std::time::Duration;
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -528,18 +572,20 @@ impl<R, P> WorkerPool<R, P> {
     /// # Examples
     ///
     /// ```rust
-    /// use pollux::WorkerPool;
+    /// use pollux::{WorkerPool, MessageEnvelope};
     /// use std::time::Duration;
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -559,18 +605,20 @@ impl<R, P> WorkerPool<R, P> {
     /// # Examples
     ///
     /// ```rust
-    /// use pollux::WorkerPool;
+    /// use pollux::{WorkerPool, MessageEnvelope};
     /// use std::time::Duration;
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -590,17 +638,19 @@ impl<R, P> WorkerPool<R, P> {
     /// # Examples
     ///
     /// ```rust
-    /// use pollux::WorkerPool;
+    /// use pollux::{WorkerPool, MessageEnvelope};
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -620,17 +670,19 @@ impl<R, P> WorkerPool<R, P> {
     /// # Examples
     ///
     /// ```rust
-    /// use pollux::WorkerPool;
+    /// use pollux::{WorkerPool, MessageEnvelope};
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor)
@@ -653,10 +705,6 @@ impl<R, P> WorkerPool<R, P> {
     ///
     /// Receivers log their activity using the `tracing` crate.
     ///
-    /// # Type Parameters
-    ///
-    /// * `M` - The message type that will be processed
-    ///
     /// # Examples
     ///
     /// ```rust
@@ -664,29 +712,32 @@ impl<R, P> WorkerPool<R, P> {
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<pollux::MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// # async fn example() {
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor);
-    /// pool.spawn_workers::<String>();
+    /// pool.spawn_workers();
     ///
     /// // Receiver loops are now running in the background
     /// // Keep the main thread alive or wait for a signal
     /// // tokio::signal::ctrl_c().await.unwrap();
     /// # }
     /// ```
-    pub fn spawn_workers<M>(&self)
+    pub fn spawn_workers(&self)
     where
-        R: MessageReceiver<M> + Send + Sync + 'static,
-        P: MessageProcessor<M> + Send + Sync + 'static,
-        M: Send + Sync + 'static,
+        R: MessageReceiver + Send + Sync + 'static,
+        P: MessageProcessor<R::Payload> + Send + Sync + 'static,
+        R::Payload: Send + Sync + 'static,
+        R::AckInfo: Send + Sync + 'static,
     {
         // Create shared semaphore for controlling max concurrent message processing
         let semaphore = Arc::new(Semaphore::new(self.config.max_in_flight));
@@ -723,10 +774,6 @@ impl<R, P> WorkerPool<R, P> {
     ///
     /// * `worker_id` - Unique identifier for this receiver (used in logging)
     ///
-    /// # Type Parameters
-    ///
-    /// * `M` - The message type that will be processed
-    ///
     /// # Examples
     ///
     /// ```rust
@@ -734,27 +781,30 @@ impl<R, P> WorkerPool<R, P> {
     ///
     /// # struct MyReceiver;
     /// # struct MyProcessor;
-    /// # impl pollux::MessageReceiver<String> for MyReceiver {
+    /// # impl pollux::MessageReceiver for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
-    /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
+    /// #     type Payload = String;
+    /// #     type AckInfo = String;
+    /// #     async fn receive_messages(&self) -> Result<Vec<pollux::MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> { Ok(vec![]) }
+    /// #     async fn acknowledge(&self, _: Self::AckInfo) -> Result<(), Self::Error> { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
-    /// #     async fn process_message(&self, _: &String) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     /// # }
     ///
     /// # async fn example() {
     /// let pool = WorkerPool::with_defaults(MyReceiver, MyProcessor);
     ///
     /// // This will block indefinitely
-    /// pool.run_single_worker::<String>(0).await;
+    /// pool.run_single_worker(0).await;
     /// # }
     /// ```
-    pub async fn run_single_worker<M>(&self, worker_id: u8)
+    pub async fn run_single_worker(&self, worker_id: u8)
     where
-        R: MessageReceiver<M> + Send + Sync + 'static,
-        P: MessageProcessor<M> + Send + Sync + 'static,
-        M: Send + Sync + 'static,
+        R: MessageReceiver + Send + Sync + 'static,
+        P: MessageProcessor<R::Payload> + Send + Sync + 'static,
+        R::Payload: Send + Sync + 'static,
+        R::AckInfo: Send + Sync + 'static,
     {
         let receiver = Arc::clone(&self.receiver);
         let processor = Arc::clone(&self.processor);
@@ -771,16 +821,17 @@ impl<R, P> WorkerPool<R, P> {
 }
 
 #[tracing::instrument(skip(receiver, processor, config, semaphore))]
-async fn run_worker_with_id<R, P, M>(
+async fn run_worker_with_id<R, P>(
     receiver: Arc<R>,
     processor: Arc<P>,
     config: WorkerPoolConfig,
     worker_id: u8,
     semaphore: Arc<Semaphore>,
 ) where
-    R: MessageReceiver<M> + Send + Sync + 'static,
-    P: MessageProcessor<M> + Send + Sync + 'static,
-    M: Send + Sync + 'static,
+    R: MessageReceiver + Send + Sync + 'static,
+    P: MessageProcessor<R::Payload> + Send + Sync + 'static,
+    R::Payload: Send + Sync + 'static,
+    R::AckInfo: Send + Sync + 'static,
 {
     loop {
         let worker_result = tokio::spawn({
@@ -808,20 +859,20 @@ async fn run_worker_with_id<R, P, M>(
 
                     // Receive messages
                     match receiver.receive_messages().await {
-                        Ok(messages) => {
-                            if messages.is_empty() {
+                        Ok(envelopes) => {
+                            if envelopes.is_empty() {
                                 continue;
                             }
 
                             tracing::debug!(
                                 worker_id,
-                                message_count = messages.len(),
+                                message_count = envelopes.len(),
                                 available_permits = semaphore.available_permits(),
                                 "received messages batch"
                             );
 
                             // Spawn a task for each message (controlled by semaphore)
-                            for message in messages {
+                            for envelope in envelopes {
                                 let receiver = Arc::clone(&receiver);
                                 let processor = Arc::clone(&processor);
                                 let semaphore = Arc::clone(&semaphore);
@@ -832,21 +883,21 @@ async fn run_worker_with_id<R, P, M>(
                                     let _permit =
                                         semaphore.acquire().await.expect("semaphore closed");
 
+                                    let MessageEnvelope { payload, ack_info } = envelope;
+
                                     // Process message with timeout
                                     let result = tokio::time::timeout(
                                         timeout,
-                                        processor.process_message(&message),
+                                        processor.process_message(&payload),
                                     )
                                     .await;
 
                                     match result {
-                                        Ok(Ok(receipt_handle)) => {
+                                        Ok(Ok(())) => {
                                             tracing::trace!("message processed successfully");
-                                            if let Some(receipt_handle) = receipt_handle {
-                                                let _ = receiver.delete_message(receipt_handle).await.inspect_err(|e| {
-                                                    tracing::error!(error=?e, "unable to delete message");
-                                                });
-                                            }
+                                            let _ = receiver.acknowledge(ack_info).await.inspect_err(|e| {
+                                                tracing::error!(error=?e, "unable to acknowledge message");
+                                            });
                                         }
                                         Ok(Err(e)) => {
                                             tracing::error!(
