@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::Context;
 use pollux::{MessageProcessor, MessageReceiver, WorkerPool, WorkerPoolConfig};
@@ -69,27 +69,35 @@ impl SQSWorker {
     }
 }
 
-impl MessageReceiver<aws_sdk_sqs::types::Message> for SQSWorker {
+impl MessageReceiver for SQSWorker {
     type Error = anyhow::Error;
-    async fn receive_messages(&self) -> Result<Vec<aws_sdk_sqs::types::Message>, Self::Error> {
-        self.receive_messages().await
+    type Payload = aws_sdk_sqs::types::Message;
+    type AckInfo = String;
+
+    async fn receive_messages(
+        &self,
+    ) -> Result<Vec<pollux::MessageEnvelope<Self::Payload, Self::AckInfo>>, Self::Error> {
+        let messages = self.receive_messages().await?;
+
+        // Convert SQS messages to MessageEnvelopes
+        let envelopes = messages
+            .into_iter()
+            .filter_map(|msg| {
+                msg.receipt_handle
+                    .clone()
+                    .map(|receipt| pollux::MessageEnvelope::new(msg, receipt))
+            })
+            .collect();
+
+        Ok(envelopes)
     }
 
-    async fn delete_message<S>(&self, receipt_handle: S) -> Result<(), Self::Error>
-    where
-        S: AsRef<str> + std::fmt::Debug + Send,
-    {
-        self.delete_message(receipt_handle.as_ref()).await
+    async fn acknowledge(&self, ack_info: Self::AckInfo) -> Result<(), Self::Error> {
+        self.delete_message(&ack_info).await
     }
 }
 
-pub struct ProcessorContext {
-    sqs_worker: SQSWorker,
-}
-
-pub struct MessageProcessorImpl {
-    context: Arc<ProcessorContext>,
-}
+pub struct MessageProcessorImpl;
 
 impl MessageProcessor<aws_sdk_sqs::types::Message> for MessageProcessorImpl {
     async fn process_message(
@@ -101,13 +109,6 @@ impl MessageProcessor<aws_sdk_sqs::types::Message> for MessageProcessorImpl {
             let wait_time = body.parse::<u64>().unwrap();
             tokio::time::sleep(Duration::from_secs(wait_time)).await;
             println!("Done processing message: {:?}", body);
-        }
-
-        if let Some(receipt_handle) = message.receipt_handle.as_ref() {
-            self.context
-                .sqs_worker
-                .delete_message(receipt_handle)
-                .await?;
         }
 
         Ok(())
@@ -140,14 +141,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("initialized sqs worker");
 
-    let message_processor = MessageProcessorImpl {
-        context: Arc::new(ProcessorContext {
-            sqs_worker: sqs_worker.clone(),
-        }),
-    };
+    let message_processor = MessageProcessorImpl {};
 
     let worker_pool_config = WorkerPoolConfig {
-        worker_count: 4,
+        receiver_count: 3,  // 3 receiver loops fetching from queue
+        max_in_flight: 100, // Up to 100 messages being processed concurrently
         processing_timeout: Duration::from_secs(120),
         heartbeat_interval: Duration::from_secs(30),
         restart_delay: Duration::from_secs(2),
