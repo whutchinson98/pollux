@@ -28,7 +28,10 @@
 //!         Ok(vec!["message1".to_string(), "message2".to_string()])
 //!     }
 //!
-//!     async fn delete_message(&self, receipt_handle: impl AsRef<str>) -> Result<(), Self::Error> {
+//!     async fn delete_message<S>(&self, receipt_handle: S) -> Result<(), Self::Error>
+//!     where
+//!         S: AsRef<str> + std::fmt::Debug + Send,
+//!     {
 //!         // Your message deletion logic here
 //!         Ok(())
 //!     }
@@ -117,7 +120,10 @@ use std::{
 ///         Ok(vec!["message1".to_string()])
 ///     }
 ///
-///     async fn delete_message(&self, receipt_handle: impl AsRef<str>) -> Result<(), Self::Error> {
+///     async fn delete_message<S>(&self, receipt_handle: S) -> Result<(), Self::Error>
+///     where
+///         S: AsRef<str> + std::fmt::Debug + Send,
+///     {
 ///         // Implementation to delete/acknowledge the message
 ///         println!("Deleting message with handle: {}", receipt_handle.as_ref());
 ///         Ok(())
@@ -154,10 +160,12 @@ pub trait MessageReceiver<M> {
     ///
     /// * `Ok(())` - Message was successfully deleted
     /// * `Err(Self::Error)` - An error occurred while deleting the message
-    fn delete_message(
+    fn delete_message<S>(
         &self,
-        receipt_handle: impl AsRef<str>,
-    ) -> impl Future<Output = Result<(), Self::Error>>;
+        receipt_handle: S,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        S: AsRef<str> + std::fmt::Debug + Send;
 }
 
 /// A trait for message processors that defines how to handle individual messages.
@@ -311,7 +319,7 @@ impl Default for WorkerPoolConfig {
 /// # impl pollux::MessageReceiver<String> for MyReceiver {
 /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
 /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-/// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+/// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
 /// # }
 /// # impl pollux::MessageProcessor<String> for MyProcessor {
 /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -357,7 +365,7 @@ impl<R, P> WorkerPool<R, P> {
     /// # impl pollux::MessageReceiver<String> for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
     /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
     /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -399,7 +407,7 @@ impl<R, P> WorkerPool<R, P> {
     /// # impl pollux::MessageReceiver<String> for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
     /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
     /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -427,7 +435,7 @@ impl<R, P> WorkerPool<R, P> {
     /// # impl pollux::MessageReceiver<String> for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
     /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
     /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -458,7 +466,7 @@ impl<R, P> WorkerPool<R, P> {
     /// # impl pollux::MessageReceiver<String> for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
     /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
     /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -489,7 +497,7 @@ impl<R, P> WorkerPool<R, P> {
     /// # impl pollux::MessageReceiver<String> for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
     /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
     /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -520,7 +528,7 @@ impl<R, P> WorkerPool<R, P> {
     /// # impl pollux::MessageReceiver<String> for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
     /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
     /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -557,7 +565,7 @@ impl<R, P> WorkerPool<R, P> {
     /// # impl pollux::MessageReceiver<String> for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
     /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
     /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -617,7 +625,7 @@ impl<R, P> WorkerPool<R, P> {
     /// # impl pollux::MessageReceiver<String> for MyReceiver {
     /// #     type Error = Box<dyn std::error::Error + Send + Sync>;
     /// #     async fn receive_messages(&self) -> Result<Vec<String>, Self::Error> { Ok(vec![]) }
-    /// #     async fn delete_message(&self, _: impl AsRef<str>) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn delete_message<S>(&self, _: S) -> Result<(), Self::Error> where S: AsRef<str> + std::fmt::Debug + Send { Ok(()) }
     /// # }
     /// # impl pollux::MessageProcessor<String> for MyProcessor {
     /// #     async fn process_message(&self, _: &String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }

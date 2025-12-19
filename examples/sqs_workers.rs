@@ -39,15 +39,15 @@ impl SQSWorker {
 }
 
 impl SQSWorker {
-    pub async fn delete_message(&self, receipt_handle: impl AsRef<str>) -> anyhow::Result<()> {
-        if receipt_handle.as_ref().is_empty() {
+    pub async fn delete_message(&self, receipt_handle: &str) -> anyhow::Result<()> {
+        if receipt_handle.is_empty() {
             anyhow::bail!("receipt handle is empty");
         }
 
         self.inner
             .delete_message()
             .queue_url(&self.config.queue_url)
-            .receipt_handle(receipt_handle.as_ref())
+            .receipt_handle(receipt_handle)
             .send()
             .await?;
 
@@ -75,8 +75,11 @@ impl MessageReceiver<aws_sdk_sqs::types::Message> for SQSWorker {
         self.receive_messages().await
     }
 
-    async fn delete_message(&self, receipt_handle: impl AsRef<str>) -> Result<(), Self::Error> {
-        self.delete_message(receipt_handle).await
+    async fn delete_message<S>(&self, receipt_handle: S) -> Result<(), Self::Error>
+    where
+        S: AsRef<str> + std::fmt::Debug + Send,
+    {
+        self.delete_message(receipt_handle.as_ref()).await
     }
 }
 
