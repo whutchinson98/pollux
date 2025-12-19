@@ -879,14 +879,14 @@ async fn run_worker_with_id<R, P>(
                     while let Ok(completion) = completion_rx.try_recv() {
                         in_flight_count = in_flight_count.saturating_sub(1);
 
-                        if completion.success {
-                            if let Err(e) = receiver.acknowledge(completion.ack_info).await {
-                                tracing::error!(
-                                    worker_id,
-                                    error = ?e,
-                                    "unable to acknowledge message"
-                                );
-                            }
+                        if completion.success
+                            && let Err(e) = receiver.acknowledge(completion.ack_info).await
+                        {
+                            tracing::error!(
+                                worker_id,
+                                error = ?e,
+                                "unable to acknowledge message"
+                            );
                         }
                     }
 
@@ -897,14 +897,14 @@ async fn run_worker_with_id<R, P>(
                         if let Some(completion) = completion_rx.recv().await {
                             in_flight_count = in_flight_count.saturating_sub(1);
 
-                            if completion.success {
-                                if let Err(e) = receiver.acknowledge(completion.ack_info).await {
-                                    tracing::error!(
-                                        worker_id,
-                                        error = ?e,
-                                        "unable to acknowledge message"
-                                    );
-                                }
+                            if completion.success
+                                && let Err(e) = receiver.acknowledge(completion.ack_info).await
+                            {
+                                tracing::error!(
+                                    worker_id,
+                                    error = ?e,
+                                    "unable to acknowledge message"
+                                );
                             }
                         }
                         continue;
