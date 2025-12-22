@@ -38,7 +38,7 @@ purge-sqs-queue:
     AWS_REGION=us-east-1 aws --endpoint-url=http://localhost:4566 sqs purge-queue --queue-url http://localhost:4566/000000000000/sqs-worker-queue
 
 run-sqs:
-    SQS_QUEUE_URL=http://localhost:4566/000000000000/sqs-worker-queue cargo run --example sqs_workers
+    RUST_LOG=pollux=trace,sqs_worker=trace SQS_QUEUE_URL=http://localhost:4566/000000000000/sqs-worker-queue cargo run --example sqs_workers
 
 # Rabbit MQ
 create-rabbitmq:
